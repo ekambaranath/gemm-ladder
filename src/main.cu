@@ -46,7 +46,7 @@ struct Rung {
   std::string name;
   bool tensor_core;                 // compared against the cuBLAS tensor-core baseline
   std::function<void()> launch;     // enqueue one GEMM
-  double ms = 0, tflops = 0, rel_err = 0, max_abs = 0;
+  double ms = 0, tflops = 0, rel_err = 0, max_abs = 0, spot = 0;
   bool ok = false;
 };
 
@@ -175,6 +175,34 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaMemcpy(dRef, dC, sizeof(float) * M * N, cudaMemcpyDeviceToDevice));
 
+  // Independent check that does not trust cuBLAS: 128 sampled outputs recomputed in fp64 on the host from
+  // the same fp16-rounded inputs. Catches the case where a kernel and cuBLAS agree but are both wrong.
+  const int NS = 128;
+  std::vector<int> si(NS), sj(NS);
+  std::vector<double> sref(NS);
+  {
+    unsigned st = 12345u;
+    for (int t = 0; t < NS; ++t) {
+      st = st * 1664525u + 1013904223u; si[t] = (int)((st >> 8) % (unsigned)M);
+      st = st * 1664525u + 1013904223u; sj[t] = (int)((st >> 8) % (unsigned)N);
+      double acc = 0;
+      for (int k = 0; k < K; ++k) acc += (double)hA[(size_t)si[t] * K + k] * (double)hB[(size_t)k * N + sj[t]];
+      sref[t] = acc;
+    }
+  }
+  // worst scaled error |got - ref| / (|ref| + 1); infinity if any sampled value is not finite
+  auto spot_err = [&](const float* d) {
+    double worst = 0;
+    for (int t = 0; t < NS; ++t) {
+      float v;
+      CUDA_CHECK(cudaMemcpy(&v, d + (size_t)si[t] * N + sj[t], sizeof(float), cudaMemcpyDeviceToHost));
+      if (!std::isfinite(v)) return (double)INFINITY;
+      worst = std::max(worst, std::fabs((double)v - sref[t]) / (std::fabs(sref[t]) + 1.0));
+    }
+    return worst;
+  };
+  const double cublas_spot = spot_err(dRef);
+
   const double t_cublas_fp32 = time_ms(cublas_fp32, reps);
   const double t_cublas_tc = time_ms(cublas_tc, reps);
 
@@ -206,19 +234,20 @@ int main(int argc, char** argv) {
     k7_wmma<128, 128, 32><<<dim3(N / 128, M / 128), dim3(256)>>>(M, N, K, dAh, dBh, dC);
   });
 
-  std::printf("%-16s %10s %10s %12s %12s  %s\n", "kernel", "ms", "TFLOP/s", "% of cuBLAS", "rel err", "check");
-  std::printf("%-16s %10.3f %10.2f %12s %12s  %s\n", "cublas_fp32", t_cublas_fp32,
-              flops / (t_cublas_fp32 * 1e-3) / 1e12, "100.0", "(ref)", "-");
-  std::printf("%-16s %10.3f %10.2f %12s %12s  %s\n", "cublas_tc_fp16", t_cublas_tc,
-              flops / (t_cublas_tc * 1e-3) / 1e12, "100.0", "-", "-");
+  std::printf("%-16s %10s %10s %12s %12s %12s  %s\n", "kernel", "ms", "TFLOP/s", "% of cuBLAS", "rel err vs cuBLAS",
+              "err vs fp64", "check");
+  std::printf("%-16s %10.3f %10.2f %12s %12s %12.2e  %s\n", "cublas_fp32", t_cublas_fp32,
+              flops / (t_cublas_fp32 * 1e-3) / 1e12, "100.0", "(ref)", cublas_spot, "-");
+  std::printf("%-16s %10.3f %10.2f %12s %12s %12s  %s\n", "cublas_tc_fp16", t_cublas_tc,
+              flops / (t_cublas_tc * 1e-3) / 1e12, "100.0", "-", "-", "-");
   std::printf("------------------------------------------------------------------------------\n");
 
   FILE* csv = csv_path.empty() ? nullptr : std::fopen(csv_path.c_str(), "w");
   if (csv) {
-    std::fprintf(csv, "kernel,size,ms,tflops,pct_of_cublas,baseline,rel_err,max_abs_err,status\n");
-    std::fprintf(csv, "cublas_fp32,%d,%.4f,%.3f,100.0,self,0,0,ref\n", size, t_cublas_fp32,
-                 flops / (t_cublas_fp32 * 1e-3) / 1e12);
-    std::fprintf(csv, "cublas_tc_fp16,%d,%.4f,%.3f,100.0,self,0,0,ref\n", size, t_cublas_tc,
+    std::fprintf(csv, "kernel,size,ms,tflops,pct_of_cublas,baseline,rel_err,max_abs_err,err_vs_fp64,status\n");
+    std::fprintf(csv, "cublas_fp32,%d,%.4f,%.3f,100.0,self,0,0,%.3e,ref\n", size, t_cublas_fp32,
+                 flops / (t_cublas_fp32 * 1e-3) / 1e12, cublas_spot);
+    std::fprintf(csv, "cublas_tc_fp16,%d,%.4f,%.3f,100.0,self,0,0,0,ref\n", size, t_cublas_tc,
                  flops / (t_cublas_tc * 1e-3) / 1e12);
   }
 
@@ -231,24 +260,25 @@ int main(int argc, char** argv) {
     if (err == cudaSuccess) err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       std::printf("%-16s launch failed: %s\n", r.name.c_str(), cudaGetErrorString(err));
-      if (csv) std::fprintf(csv, "%s,%d,0,0,0,-,0,0,LAUNCH_FAIL\n", r.name.c_str(), size);
+      if (csv) std::fprintf(csv, "%s,%d,0,0,0,-,0,0,0,LAUNCH_FAIL\n", r.name.c_str(), size);
       ++failures;
       cudaGetLastError();
       continue;
     }
     compare(dC, dRef, (size_t)M * N, &r.rel_err, &r.max_abs);
+    r.spot = spot_err(dC);
     const double tol = r.tensor_core ? 2e-3 : 1e-4;
-    r.ok = r.rel_err < tol;
+    r.ok = r.rel_err < tol && r.spot < tol;
     r.ms = time_ms(r.launch, reps);
     r.tflops = flops / (r.ms * 1e-3) / 1e12;
     const double base = r.tensor_core ? t_cublas_tc : t_cublas_fp32;
     const double pct = 100.0 * base / r.ms;
-    std::printf("%-16s %10.3f %10.2f %11.1f%% %12.2e  %s\n", r.name.c_str(), r.ms, r.tflops, pct,
-                r.rel_err, r.ok ? "PASS" : "FAIL");
+    std::printf("%-16s %10.3f %10.2f %11.1f%% %12.2e %12.2e  %s\n", r.name.c_str(), r.ms, r.tflops, pct,
+                r.rel_err, r.spot, r.ok ? "PASS" : "FAIL");
     if (!r.ok) ++failures;
     if (csv)
-      std::fprintf(csv, "%s,%d,%.4f,%.3f,%.2f,%s,%.3e,%.3e,%s\n", r.name.c_str(), size, r.ms, r.tflops,
-                   pct, r.tensor_core ? "cublas_tc_fp16" : "cublas_fp32", r.rel_err, r.max_abs,
+      std::fprintf(csv, "%s,%d,%.4f,%.3f,%.2f,%s,%.3e,%.3e,%.3e,%s\n", r.name.c_str(), size, r.ms, r.tflops,
+                   pct, r.tensor_core ? "cublas_tc_fp16" : "cublas_fp32", r.rel_err, r.max_abs, r.spot,
                    r.ok ? "PASS" : "FAIL");
   }
   if (csv) std::fclose(csv);
