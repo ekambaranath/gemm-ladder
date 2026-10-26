@@ -20,8 +20,8 @@ flowchart LR
 ```bash
 git clone https://github.com/ekambaranath/gemm-ladder && cd gemm-ladder
 make check                       # builds, checks all 7 rungs vs cuBLAS at 512^3
-make run                         # M=N=K=4096, writes results/gemm_ladder.csv
-python scripts/plot_ladder.py    # writes docs/gemm_ladder.png
+make run                         # M=N=K=4096, writes results/gemm_ladder.csv (git-ignored)
+python scripts/plot_ladder.py results/gemm_ladder.csv docs/gemm_ladder.png
 ```
 
 Other GPUs: `make ARCH=sm_80` (A100), `sm_89` (L4/RTX 40), `sm_90` (H100). No GPU? `make emu` runs every kernel
@@ -76,57 +76,68 @@ Every rung is checked before it is timed, two ways:
 Output is pre-filled with a NaN pattern, so an unwritten element fails. A rung that fails either check is reported
 FAIL and its timing is not to be trusted. Tolerance: `< 1e-4` for fp32 rungs, `< 2e-3` for the fp16 tensor-core rung.
 
-Note on the "0.00e+00" errors: the fp32 rungs match cuBLAS fp32 *bit for bit*. That is plausible rather than
-suspicious, because each of these kernels accumulates every output element sequentially over k with fused
-multiply-add, and a non-split-K cuBLAS SGEMM does the same, so the rounding sequence is identical. The tensor-core
-rung accumulates differently and shows a small non-zero error (about 7e-6). The fp64 check above is what makes the
-claim independent of that explanation.
+**Measured outcome (T4, 4096^3, worst scaled error over the 128 samples, `|got - ref| / (|ref| + 1)`):**
+cuBLAS fp32 and all six fp32 rungs k1 to k6 show the same 2.18e-05, and match cuBLAS bit for bit (relative error
+exactly 0). That is expected, not suspicious: each of these kernels accumulates every output sequentially over k with
+fused multiply-add, and a non-split-K cuBLAS SGEMM does the same, so the rounding sequence is identical. The fp64
+check shows that this shared result is the correct one up to ordinary fp32 accumulation error over K=4096. The
+tensor-core rung accumulates differently and shows 1.37e-04 against fp64 (and 6.7e-6 against cuBLAS fp32 on the
+full-matrix Frobenius metric; the two metrics are not directly comparable), well inside its 2e-3 tolerance.
+The fp32 tolerance of 1e-4 is only about 5x above the observed error, and fp32 accumulation error grows with K,
+so it would need loosening for much larger K.
 
 ## Results
 
-Measured on a Tesla T4 (Colab, sm_75, 40 SMs), M=N=K=4096, CUDA events, median of 10 runs after warm-up, one
-session. Raw data: `results/gemm_ladder.csv`.
+Tesla T4 (Colab, sm_75, 40 SMs), M=N=K=4096, CUDA events, median of 10 timed runs per launch after warm-up. The
+whole benchmark was run **three times**; the table gives the median over those three runs and the observed range.
+Raw data: `results/gemm_ladder_median.csv` (table and chart) and `results/gemm_ladder_run3.csv` (one full run
+including the fp64 column). Both were transcribed from console output.
 
 ![GEMM ladder](docs/gemm_ladder.png)
 
-| kernel | ms | TFLOP/s | % of matching cuBLAS | step speedup | rel err vs cuBLAS |
+| kernel | ms (median) | TFLOP/s (range over 3 runs) | % of matching cuBLAS (range) | step speedup | err vs fp64 |
 |---|---|---|---|---|---|
-| cuBLAS fp32 (reference) | 29.60 | 4.64 | 100 | | |
-| cuBLAS fp16 tensor cores | 3.30 | 41.68 | 100 | | |
-| k1 naive | 2221.04 | 0.06 | 1.3 | | 0 |
-| k2 coalesced | 231.61 | 0.59 | 12.8 | 9.6x | 0 |
-| k3 shared-memory tiling | 146.57 | 0.94 | 20.2 | 1.58x | 0 |
-| k4 1D register tile | 69.59 | 1.98 | 42.5 | 2.11x | 0 |
-| k5 2D register tile | 39.49 | 3.48 | 75.0 | 1.76x | 0 |
-| k6 vectorized | 35.15 | 3.91 | 84.2 | 1.12x | 0 |
-| k7 WMMA tensor cores (fp16) | 6.75 | 20.37 | 48.9 (of tensor-core cuBLAS) | 5.2x vs k6 | 6.7e-6 |
+| cuBLAS fp32 (reference) | 29.62 | 4.64 (4.49 to 4.64) | 100 | | 2.18e-05 |
+| cuBLAS fp16 tensor cores | 3.36 | 40.87 (37.96 to 41.69) | 100 | | |
+| k1 naive | 2220.7 | 0.06 | 1.3 (1.3 to 1.4) | | 2.18e-05 |
+| k2 coalesced | 233.9 | 0.59 (0.58 to 0.59) | 12.7 (12.7 to 12.9) | 9.5x | 2.18e-05 |
+| k3 shared-memory tiling | 146.9 | 0.94 (0.92 to 0.94) | 20.2 (20.2 to 20.4) | 1.59x | 2.18e-05 |
+| k4 1D register tile | 69.7 | 1.97 (1.94 to 1.98) | 42.5 (42.5 to 43.1) | 2.11x | 2.18e-05 |
+| k5 2D register tile | 39.5 | 3.48 (3.39 to 3.48) | 75.0 (75.0 to 75.5) | 1.76x | 2.18e-05 |
+| k6 vectorized | 35.4 | 3.88 (3.78 to 3.91) | 83.6 (83.6 to 84.2) | 1.11x | 2.18e-05 |
+| k7 WMMA tensor cores (fp16) | 6.57 | 20.92 (20.37 to 21.30) | 51.2 (48.9 to 55.1), of tensor-core cuBLAS | 5.4x vs k6 | 1.37e-04 |
 
-k1 to k6 is a 63x speedup. k7 is not an improvement on k6 in the same units, because it changes precision.
+k1 to k6 is a 63x speedup. k7 is a separate comparison because it changes precision.
+Step speedups are ratios of the median times.
 
 ### What the data shows
 
-- **Memory access pattern dominates first.** k1 to k2 is 9.6x from an index remapping alone, with identical
+- **Memory access pattern dominates first.** k1 to k2 is 9.5x from an index remapping alone, with identical
   arithmetic.
-- **Reuse is the next lever, with diminishing returns.** Shared-memory tiling gave 1.58x, register tiling 2.1x then
+- **Reuse is the next lever, with diminishing returns.** Shared-memory tiling gave 1.59x, register tiling 2.11x then
   1.76x. FMAs per shared-memory load rise from 0.5 (k3) to about 0.9 (k4) to 4 (k5), but k3 to k5 is a 3.7x speedup,
   not 8x, so something else caps the gain.
-- **Vectorization is a small win here (12%).** k6 changes two things at once (float4 loads and a transposed A tile),
+- **Vectorization is a small win here (11%).** k6 changes two things at once (float4 loads and a transposed A tile),
   so the data cannot say which one helped; that needs an ablation.
-- **At 512^3 the ladder flattens at the top.** k5 and k4 take the same time (0.278 ms vs 0.281 ms). With 128x128
-  tiles a 512x512 output is only 16 blocks for 40 SMs, so the GPU cannot be filled. The grid arithmetic is fact; that
-  it is the cause is my inference, not something I profiled.
-- **Tensor cores: big absolute gain, half of cuBLAS.** k7 is 5.2x faster than the best fp32 rung and reaches 49%
-  of cuBLAS tensor-core GEMM (about 31% of the T4's 65 TFLOP/s fp16 spec).
+- **The fp32 results are stable.** Each fp32 rung's percent-of-cuBLAS varied by at most 0.6 points across three runs.
+- **At 512^3 the ladder flattens at the top** (one earlier run): k5 and k4 take the same time (0.278 ms vs
+  0.281 ms). With 128x128 tiles a 512x512 output is only 16 blocks for 40 SMs, so the GPU cannot be filled. The grid
+  arithmetic is fact; that it is the cause is my inference, not something I profiled.
+- **Tensor cores: big absolute gain, about half of cuBLAS.** k7 is 5.4x faster than the best fp32 rung and reaches
+  49 to 55% of cuBLAS tensor-core GEMM (about 32% of the T4's 65 TFLOP/s fp16 spec at the median).
 
 ### What it does not show (yet)
 
-- **Why k7 stops at 49%.** Likely missing pieces: `cp.async` software pipelining, an XOR-swizzled shared layout
-  instead of padding, and per-shape tuned tile sizes. These are hypotheses until profiled.
+- **Why k7 stops at about half of cuBLAS.** Likely missing pieces: `cp.async` software pipelining, an XOR-swizzled
+  shared layout instead of padding, and per-shape tuned tile sizes. These are hypotheses until profiled.
+- **Why cuBLAS tensor-core throughput moved 38 to 42 TFLOP/s between runs** while k7 moved 20.4 to 21.3. The k7
+  percentage range (49 to 55%) comes mostly from the cuBLAS baseline. Power or thermal clock changes are a plausible
+  cause but the clock was not measured.
 - **Percent of hardware peak.** The harness prints a spec-sheet fp32 peak (8.14 TFLOP/s at the 1590 MHz boost
   clock). T4s are power-capped and typically run below boost under sustained load, so percent-of-spec flatters the
-  hardware; percent-of-cuBLAS is the more reliable number and is what the table uses. The actual clock was not measured.
-- **Run-to-run variance.** One session, median only. No Nsight Compute profile yet (occupancy, bank conflicts, stall
-  reasons); that is the evidence that would turn these hypotheses into findings.
+  hardware; percent-of-cuBLAS is the more reliable number and is what the table uses.
+- **Nsight Compute data.** No profile yet (occupancy, bank conflicts, stall reasons). That is the evidence that would
+  turn these hypotheses into findings.
 
 ## Known limits (deliberate)
 

@@ -1,0 +1,10 @@
+kernel,size,ms,tflops,pct_of_cublas,baseline,rel_err_vs_cublas,err_vs_fp64,status
+cublas_fp32,4096,30.596,4.49,100.0,self,0,2.18e-05,ref
+cublas_tc_fp16,4096,3.621,37.96,100.0,self,0,0,ref
+k1_naive,4096,2220.7,0.06,1.4,cublas_fp32,0,2.18e-05,PASS
+k2_coalesced,4096,238.029,0.58,12.9,cublas_fp32,0,2.18e-05,PASS
+k3_smem,4096,149.957,0.92,20.4,cublas_fp32,0,2.18e-05,PASS
+k4_regtile1d,4096,70.989,1.94,43.1,cublas_fp32,0,2.18e-05,PASS
+k5_regtile2d,4096,40.543,3.39,75.5,cublas_fp32,0,2.18e-05,PASS
+k6_vectorized,4096,36.342,3.78,84.2,cublas_fp32,0,2.18e-05,PASS
+k7_wmma,4096,6.57,20.92,55.1,cublas_tc_fp16,6.71e-06,1.37e-04,PASS

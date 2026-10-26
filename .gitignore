@@ -1,3 +1,4 @@
 build/
 results/*.ncu-rep
 __pycache__/
+results/gemm_ladder.csv
